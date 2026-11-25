@@ -1,0 +1,11 @@
+{
+  "output": "lab4-report.docx",
+  "source": "lab4-report.build.cjs",
+  "skill": "word",
+  "assets": [
+    "report-assets/pipeline.png",
+    "report-assets/ui.png"
+  ],
+  "build": "multitool-node lab4-report.build.cjs",
+  "verify": "multitool-node --skill word verify.cjs lab4-report.docx"
+}

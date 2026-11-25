@@ -1,0 +1,6 @@
+.vs/
+.office-verify/
+bin/
+obj/
+publish/
+*.user
