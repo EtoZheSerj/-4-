@@ -134,6 +134,8 @@ public sealed class MainForm : Form
         FormClosing += OnFormClosing;
     }
 
+    /// Событие «Открыть»: диалог выбора файла и превью в PictureBox.
+    /// Всё выполняется в UI-потоке (контролы трогают только здесь).
     private void OnOpen(object? sender, EventArgs e)
     {
         using var dialog = new OpenFileDialog
@@ -162,6 +164,13 @@ public sealed class MainForm : Form
         }
     }
 
+    /// Событие «Запустить»: стартует обработку.
+    ///
+    /// ПОТОКИ: это async void — метод сразу возвращается в UI-цикл, а продолжение
+    /// после await выполняется снова в UI-потоке (контекст синхронизации WinForms).
+    /// Сам ContrastProcessor работает в своих фоновых потоках, а обновление прогресса
+    /// идет через Progress<T>, колбэк которого тоже исполняется в UI-потоке.
+    /// Поэтому никакой доступ к контролам из чужих потоков не происходит.
     private async void OnRun(object? sender, EventArgs e)
     {
         if (_busy) return;
@@ -228,6 +237,9 @@ public sealed class MainForm : Form
         }
     }
 
+    /// Кнопка «Отмена»: сигналит процессору остановиться. Выполняется в UI-потоке,
+    /// ничего опасного не делает — просто ставит флаг. Реальную остановку потоков
+    /// сделает сам ContrastProcessor.
     private void OnCancel(object? sender, EventArgs e)
     {
         if (!_busy || _processor is null)
@@ -240,6 +252,8 @@ public sealed class MainForm : Form
         _status.Text = "Отмена...";
     }
 
+    /// Кнопка «Сохранить»: завершает результат в PNG.
+    /// Saving выполняется в SavePngAsync на фоне, UI не блокируется.
     private async void OnSave(object? sender, EventArgs e)
     {
         if (_result is null || _busy) return;
@@ -264,6 +278,7 @@ public sealed class MainForm : Form
         }
     }
 
+    /// При закрытии формы — отменяем активную обработку и освобождаем результат.
     private void OnFormClosing(object? sender, FormClosingEventArgs e)
     {
         _processor?.Cancel();

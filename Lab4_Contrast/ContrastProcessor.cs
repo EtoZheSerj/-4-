@@ -56,6 +56,14 @@ public sealed class ContrastProcessor : IDisposable
     private double _meanBrightness;
     private long _lastReportTick;    // троттлинг отчётов о прогрессе
 
+    /// Конструктор.
+    /// workerCount — сколько фоновых потоков создаст пул (StartWorkers).
+    /// maxParallel — сколько фрагментов может обрабатываться ОДНОВРЕМЕННО (семафор),
+    ///               не больше workerCount; счёт идёт без него, поэтому при 1 потоке
+    ///               семафор фактически не ограничивает.
+    /// contrast — коэффициент k формулы Adjust.
+    /// progress — колбэк прогресса (IProgress«T» маршалит вызов в UI-поток).
+    /// delayPerTileMs — демо-пауза на фрагмент (прерывается отменой, не Sleep).
     public ContrastProcessor(int workerCount, int maxParallel, double contrast, IProgress<ProgressInfo>? progress = null, int delayPerTileMs = 0)
     {
         if (workerCount < 1) throw new ArgumentOutOfRangeException(nameof(workerCount));
@@ -80,6 +88,13 @@ public sealed class ContrastProcessor : IDisposable
     }
     // ---------------------------------------------------------------------
     /// Полный проход: чтение → фаза 1 → фаза 2 → сборка. null, если обработка отменена.
+    ///
+    /// ПОТОКИ: этот метод запускается из UI-потока (см. MainForm.OnRun), но почти всё
+    /// время он находится в await и НЕ блокирует UI. Внутри:
+    ///   - чтение и декодирование делаются асинхронно (LoadSourceAsync);
+    ///   - пул потоков (StartWorkers) выполняет фазы 1 и 2;
+    ///   - ожидание барьеров _sumDone/_allDone — через WaitHandle (реальный сон потока),
+    ///     обёрнутый в Task.Run, чтобы не замораживать UI-поток.
     public async Task<Bitmap?> ProcessAsync(string path)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -137,6 +152,9 @@ public sealed class ContrastProcessor : IDisposable
         return BuildBitmap();
     }
 
+    /// Сохранение результата в PNG.
+    /// ПОТОКИ: рендер PNG (тяжёлая операция) вынесен в Task.Run, чтобы не блокировать
+    /// UI-поток, а запись файла идёт через асинхронный FileStream (без занятия потока).
     public static async Task SavePngAsync(Bitmap bitmap, string path)
     {
         Bitmap copy = new Bitmap(bitmap);
@@ -165,6 +183,9 @@ public sealed class ContrastProcessor : IDisposable
     }
 
     /// Запрос отмены: виден всем потокам пула и писателю.
+    /// ПОТОКИ: _cancel — ManualResetEvent, потому открытый один раз, он «виден» всем,
+    /// кто на нём ждёт (воркеры в WaitAny, AcquirePermit, WaitDemoDelay и сам
+    /// ProcessAsync). WakeAll дополнительно будит воркеров, спящих на _jobSignals.
     public void Cancel()
     {
         lock (_sync)
@@ -176,6 +197,8 @@ public sealed class ContrastProcessor : IDisposable
         WakeAll();   // разбудить тех, кто ждёт «появилось задание»
     }
 
+    /// Чтение файла в память без блокировки UI-потока, затем декодирование
+    /// в BGRA-буфер. Тяжёлое декодирование — в Task.Run (на фоновом потоке пула задач).
     private async Task LoadSourceAsync(string path)
     {
         byte[] raw;
@@ -210,6 +233,9 @@ public sealed class ContrastProcessor : IDisposable
         }
     }
 
+    /// Декодирует входной файл в плоский байтовый массив в формате BGRA.
+    /// Вызывается на фоновом потоке (в LoadSourceAsync), поэтому про многопоточность
+    /// здесь думать не нужно — у метода нет общих данных.
     private static (byte[] src, byte[] dst, int width, int height, int stride) DecodeToBgra(byte[] raw)
     {
         using var stream = new MemoryStream(raw, writable: false);
@@ -240,6 +266,9 @@ public sealed class ContrastProcessor : IDisposable
         }
     }
 
+    /// Сброс всего состояния перед новым проходом.
+    /// ПОТОКИ: вызывается в ProcessAsync до создания воркеров, поэтому гонок нет;
+    /// под lock(_sync) обнуляются разделяемые поля, а события сбрасываются вне lock.
     private void ResetState()
     {
         lock (_sync)
@@ -269,6 +298,8 @@ public sealed class ContrastProcessor : IDisposable
     }
 
     /// Планировщик: нарезка изображения на фрагменты. Вызывается под lock (_sync).
+    /// Ключ к «data parallelism»: каждый тайл — независимая единица работы,
+    /// которую разные потоки могут выполнять параллельно без пересечения.
     private void BuildTiles(Queue<Tile> target)
     {
         for (int y = 0; y < _height; y += TileSize)
@@ -282,6 +313,11 @@ public sealed class ContrastProcessor : IDisposable
         }
     }
 
+    /// Создание пула фоновых потоков.
+    /// ПОТОКИ: каждый воркер — отдельный Thread с именем worker-N. Ни один из них НЕ
+    /// является UI-потоком, значит они не могут трогать контролы — с UI общаются
+    /// только через IProgress<T>. Потоки фоновые (IsBackground), чтобы они не
+    /// удерживали процесс при закрытии формы.
     private void StartWorkers()
     {
         _workers = new Thread[_workerCount];
@@ -297,6 +333,8 @@ public sealed class ContrastProcessor : IDisposable
         }
     }
 
+    /// Остановка всех воркеров: join() ждёт завершения каждого потока пула.
+    /// Выполняется в Task.Run, чтобы wait не хватал UI-поток.
     private Task StopWorkersAsync() => Task.Run(() =>
     {
         foreach (var worker in _workers)
@@ -304,12 +342,26 @@ public sealed class ContrastProcessor : IDisposable
         _workers = Array.Empty<Thread>();
     });
 
+    /// Будит все спящие воркеры сигналом о появлении работы.
+    /// Используется при старте фазы 1, переходе к фазе 2 и при отмене.
     private void WakeAll()
     {
         foreach (var signal in _jobSignals)
             signal.Set();
     }
 
+    /// Главный цикл фонового потока пула (по одному на каждый Thread).
+    ///
+    /// ПОТОКИ — это сердце многопоточности:
+    /// 1. Поток засыпает на WaitAny(_cancel, _jobSignals[index]) — примитив события,
+    ///    а не опрос. У каждого воркера СВОЙ AutoResetEvent, чтобы будить только его.
+    /// 2. Проснувшись, поток входит во ВНУТРЕННИЙ цикл: жадно выхватывает тайлы из
+    ///    очереди текущей фазы, пока она не опустеет. Взятие тайла — под коротким
+    ///    lock(_sync); сама обработка (RunSumStage/RunApplyStage) выполняется ВНЕ lock,
+    ///    поэтому потоки реально работают параллельно.
+    /// 3. В конце фазы 2 поток видит, что очередь пуста И закрыта, и завершается.
+    /// Синхронизацию даёт то, что каждый тайл достаётся ровно одному потоку
+    /// (Dequeue внутри lock) и обрабатывается в приватном буфере.
     private void WorkerLoop(int index)
     {
         var handles = new WaitHandle[] { _cancel, _jobSignals[index] };
@@ -349,6 +401,12 @@ public sealed class ContrastProcessor : IDisposable
     }
 
     /// Фаза 1: сумма яркостных величин фрагмента. false — получена отмена.
+    ///
+    /// ПОТОКИ: тяжёлое суммирование (SumBrightness) идёт ВНЕ критической секции,
+    /// параллельно во всех воркерах. В общий _brightnessSum каждый поток добавляет
+    /// свой результат только под lock(_sync) (короткая атомарная операция), поэтому
+    /// потерянных обновлений нет. Всё это повторяется для каждого тайла; последний
+    /// обработавший тайл устанавливает барьер _sumDone (++_sumCount == _tilesTotal).
     private bool RunSumStage(Tile tile)
     {
         if (!AcquirePermit())
@@ -388,6 +446,11 @@ public sealed class ContrastProcessor : IDisposable
     }
 
     /// Фаза 2: применение контраста к фрагменту. false — получена отмена.
+    ///
+    /// ПОТОКИ: обработка (ProcessTile) создаёт ПРИВАТНЫЙ буфер для каждого тайла,
+    /// поэтому потоки не делят память на запись и не мешают друг другу. Готовый
+    /// фрагмент копируется в общий _dst под lock (короткая секция). Каждый тайл
+    /// пишется в свой непересекающийся регион _dst, значит гонок нет даже внутри lock.
     private bool RunApplyStage(Tile tile)
     {
         if (!AcquirePermit())
@@ -426,9 +489,17 @@ public sealed class ContrastProcessor : IDisposable
     }
 
     /// Демонстрационная пауза на фрагмент: прерывается сигналом отмены, а не Thread.Sleep.
+    /// WaitOne(timeout) сам просыпается либо по таймауту, либо по _cancel — это
+    /// позволяет отмене сработать мгновенно, не ожидая окончания паузы.
     private bool WaitDemoDelay()
         => _delayPerTileMs <= 0 || !_cancel.WaitOne(_delayPerTileMs);
 
+    /// Отчёт о прогрессе с троттлингом: не чаще одного раза в ProgressIntervalMs.
+    ///
+    /// ПОТОКИ: вызывается из воркеров, но сам вызов ведёт себя потокобезопасно,
+    /// потому что самый «дорогой» путь в UI (IProgress.Report) происходит лишь у
+    /// одного потока за раз — слот «права отчёта» занимается через Interlocked.CompareExchange.
+    /// Финальный отчёт (done == _passTotal) отправляется всегда.
     private void ReportProgress(int done)
     {
         if (done < _passTotal)
@@ -444,6 +515,11 @@ public sealed class ContrastProcessor : IDisposable
         _progress?.Report(new ProgressInfo(done, _passTotal));
     }
 
+    /// Взятие «слота» семафора для обработки тайла.
+    ///
+    /// ПОТОКИ: даже если потоков много, семафор не даёт обрабатывать одновременно
+    /// больше _maxParallel тайлов. Ожидание ведётся порциями по 50 мс, и на каждой
+    /// итерации проверяется отмена — поэтому воркер не застрянет в очереди семафора.
     private bool AcquirePermit()
     {
         // Семафор ограничивает число одновременно обрабатываемых фрагментов.
@@ -456,6 +532,9 @@ public sealed class ContrastProcessor : IDisposable
     }
 
     /// Сумма яркостных величин 299R+587G+114B по фрагменту (вне критической секции).
+    /// ПОТОКИ: работает только с локальными переменными и с _src (неизменяем после
+    /// загрузки), поэтому блокировка не нужна даже при одновременных вызовах из
+    /// разных воркеров.
     private (long sum, long count) SumBrightness(Tile tile)
     {
         long sum = 0;
@@ -476,6 +555,9 @@ public sealed class ContrastProcessor : IDisposable
         return (sum, (long)tile.W * tile.H);
     }
 
+    /// Средняя яркость кадра = _brightnessSum / (1000 * _pixelCount).
+    /// 1000 появляется из-за весов 299/587/114 (не нормированных). lock нужен,
+    /// чтобы прочитать два связанных поля (_brightnessSum и _pixelCount) одним целым.
     private double ComputeMeanBrightness()
     {
         lock (_sync)
@@ -510,6 +592,9 @@ public sealed class ContrastProcessor : IDisposable
         }
     }
 
+    /// Применяет формулу контраста ко всем пикселям.
+    /// Чистая функция: зависит только от аргументов, не трогает общее состояние.
+    /// Байты идут парами B,G,R, альфа (4-й, i+3) не меняется.
     public static void ApplyContrast(byte[] buffer, double mean, double k)
     {
         for (int i = 0; i + 3 < buffer.Length; i += 4)
@@ -521,6 +606,8 @@ public sealed class ContrastProcessor : IDisposable
         }
     }
 
+    /// Математика одного канала: mean + k*(channel - mean) с зажатием в [0;255].
+    /// Чистая функция, вызывается из ApplyContrast (параллельных воркеров) — без общих данных.
     private static byte Adjust(byte channel, double mean, double k)
     {
         double value = mean + k * (channel - mean);
@@ -529,6 +616,9 @@ public sealed class ContrastProcessor : IDisposable
         return (byte)(value + 0.5);
     }
 
+    /// Сборка Bitmap из общего буфера _dst. Вызывается после остановки воркеров,
+    /// т.е. в момент, когда _dst уже полностью готов; lock(_sync) здесь защищает
+    /// от гипотетического параллельного чтения (двойная страховка оформления).
     private Bitmap BuildBitmap()
     {
         Bitmap result;
@@ -559,6 +649,9 @@ public sealed class ContrastProcessor : IDisposable
         return result;
     }
 
+    /// Освобождение ресурсов. Потоки: сначала запрашивает отмену, затем ждёт каждый
+    /// живой воркер до 5 секунд (Join с таймаутом — чтобы висящий поток не заблокировал
+    /// закрытие формы навсегда), потом освобождает все примитивы синхронизации.
     public void Dispose()
     {
         if (_disposed) return;

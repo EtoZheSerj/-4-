@@ -6,6 +6,10 @@ namespace Lab4Contrast;
 internal static class Program
 {
     [STAThread]
+    /// Точка входа программы.
+    /// [STAThread] обязателен для WinForms: делает главный поток UI-потоком,
+    /// единственным, кто может трогать контролы.
+    /// Application.Run блокирует этот поток, крутя цикл сообщений до закрытия формы.
     private static void Main()
     {
         InstallCrashHandlers();
@@ -16,6 +20,10 @@ internal static class Program
         Application.Run(new MainForm());
     }
 
+    /// Регистрирует глобальные перехватчики необработанных исключений.
+    /// ПОТОКИ: каждый перехватчик вызывается в том потоке, где упало исключение,
+    /// поэтому сюда могут прийти и из фоновых воркеров ContrastProcessor.
+    /// e.SetObserved() гасит исключение недосмотренной Task, чтобы оно не убило процесс.
     private static void InstallCrashHandlers()
     {
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -28,6 +36,9 @@ internal static class Program
         };
     }
 
+    /// Записывает исключение в error.log рядом с exe и показывает MessageBox.
+    /// Вызывается из разных потоков (см. InstallCrashHandlers); File.AppendAllText
+    /// потокобезопасен для дозаписи, а кор-лог помещён в try/catch, чтобы логгер сам не падал.
     private static void Report(Exception? error)
     {
         if (error is null) return;
